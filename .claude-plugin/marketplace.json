@@ -1,0 +1,17 @@
+{
+  "name": "skill-recomposer",
+  "description": "Marketplace for the Skill Recomposer Claude Code plugin.",
+  "owner": {
+    "name": "Shorii-Zoo"
+  },
+  "plugins": [
+    {
+      "name": "skill-recomposer",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Shorii-Zoo/claude-skill-recomposer.git"
+      },
+      "description": "Decompose, normalize, recompose, integrate, audit, and safely evolve overlapping Claude skills."
+    }
+  ]
+}

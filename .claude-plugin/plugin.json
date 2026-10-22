@@ -1,0 +1,12 @@
+{
+  "name": "skill-recomposer",
+  "displayName": "Skill Recomposer",
+  "version": "0.1.0",
+  "description": "Decompose, normalize, recompose, integrate, audit, and safely evolve overlapping Claude skills.",
+  "author": {
+    "name": "Shorii-Zoo",
+    "url": "https://github.com/Shorii-Zoo"
+  },
+  "repository": "https://github.com/Shorii-Zoo/claude-skill-recomposer",
+  "keywords": ["skills", "refactoring", "recomposition", "claude-code"]
+}

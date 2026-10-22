@@ -1,0 +1,775 @@
+From 9cd986d3bb8f13229adf3b01e015f2e675b1a5c2 Mon Sep 17 00:00:00 2001
+From: Shorii <suchorii.69@gmail.com>
+Date: Sun, 1 Nov 2026 14:43:31 +0100
+Subject: [PATCH] Make operation history append-only across rollback
+
+Restore managed registry state independently of the operations ledger, append rollback records, and validate ledger transitions plus canonical managed-state digests.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ README.md                        |   8 +-
+ REGISTRY.schema.json             |   9 +-
+ core/registry.md                 |  31 +++++
+ core/transactions.md             |  13 +-
+ evals/README.md                  |  10 +-
+ evals/evals.json                 |  11 +-
+ operations/audit.md              |   2 +-
+ operations/rollback.md           |  12 +-
+ procedures/patching.md           |  12 +-
+ scripts/validate_repository.py   | 115 +++++++++++++++-
+ skills/skill-recomposer/SKILL.md |  13 +-
+ tests/test_repository.py         | 226 +++++++++++++++++++++++++++++++
+ tests/test_workflow_contracts.py |  11 ++
+ 13 files changed, 441 insertions(+), 32 deletions(-)
+
+diff --git a/README.md b/README.md
+index 4c156aa..49e7118 100644
+--- a/README.md
++++ b/README.md
+@@ -216,7 +216,7 @@ Preview repairs:
+ 
+ Audit includes topic rebalancing, artifact graph integrity, routing/policy review, host-layout validation, and runtime-contract drift.
+ 
+-Repair mode requires an existing registry; missing state is never seeded. A parseable but invalid or inconsistent registry can be diagnosed and repaired transactionally with a readable recoverable snapshot stored outside the patch payload. The patch retains the original invalid registry bytes as its before-image; rollback and recovery use the patch, not the snapshot. An unreadable or unrecoverable registry blocks repair. Report-only audit remains read-only.
++Repair mode requires an existing registry; missing state is never seeded. A parseable but invalid or inconsistent registry can be diagnosed and repaired transactionally with a readable recoverable snapshot stored outside the patch payload. The patch retains the original invalid registry bytes as its before-image; rollback and recovery use the patch, not the snapshot. Repair requires a parsed JSON mapping and an `operations` list whose history can be preserved unchanged. An unreadable registry or history that cannot be preserved blocks repair. Full registry bytes are forensic; rollback restores known invalid managed fields through the projection excluding `operations`, merging the live ledger rather than overwriting it. Report-only audit remains read-only.
+ 
+ ### Rollback
+ 
+@@ -230,7 +230,7 @@ Preview:
+ /skill-recomposer rollback <operation-id> --dry-run
+ ```
+ 
+-Rollback verifies hashes, metadata, dependency history, and runtime preconditions before reversing a mutation. It restores the recorded prestate exactly; pre-existing invalidity repaired by `audit --fix` is reported faithfully, not silently corrected.
++Rollback verifies hashes, metadata, dependency history, and runtime preconditions before reversing a mutation. It restores recorded managed prestate: other files retain exact bytes; the registry restores its managed projection (all top-level fields except `operations`) and merges the live append-only ledger. Canonical JSON projection digests, not whole-registry byte hashes, establish applicability and restoration. Every committed ledger entry survives rollback, which appends its own entry after validation. Pre-existing invalid managed fields repaired by `audit --fix` are restored and reported faithfully, not silently corrected.
+ 
+ ## Source eligibility
+ 
+@@ -445,7 +445,7 @@ Each committed mutating operation stores one self-contained rollback container o
+ 
+ The patch can represent text diffs, binary changes, file modes, symlinks, moves, state changes, and deleted disposable sources without depending on Git.
+ 
+-The payload covers managed filesystem mutations and excludes the operation's own patch container and operation metadata directory. `file_changes` metadata describes those mutations; repair snapshots and failure/recovery records live outside the payload. A repair patch retains the original invalid registry bytes as its before-image, so rollback and recovery do not depend on the snapshot. On failure before commit, partial operation metadata is cleaned up when cleanup succeeds and retained when it fails. Once mutation has begun, restore from before-images and verify before cleaning up metadata; never remove the recovery patch first. Retain the patch and metadata if recovery fails. Rollback follows the same rules.
++The payload covers managed filesystem mutations and excludes the operation's own patch container and operation metadata directory. `file_changes` metadata describes those mutations; repair snapshots and failure/recovery records live outside the payload. A repair patch retains the original invalid registry bytes as its before-image, so rollback and recovery do not depend on the snapshot. On failure before commit, partial operation metadata is cleaned up when cleanup succeeds and retained when it fails. Once mutation has begun, restore from before-images and verify before cleaning up metadata; never remove the recovery patch first. Retain the patch and metadata if recovery fails. Rollback follows the same rules. Registry recovery restores its managed projection and merges the live ledger, never overwrites forensic full bytes or truncates committed history. Validate the committed entry and full proposed ledger after final state validation, then atomically append it. Unrelated ledger appends do not create a shared-registry dependency conflict, but any managed-projection drift blocks rollback to avoid erasing newer changes. See `core/registry.md` for deterministic canonical JSON digest rules and the expected ledger-only snapshot when rolling back initial state creation.
+ 
+ ### Garbage collection
+ 
+@@ -547,7 +547,7 @@ plugin directory still requires a license; no license has been chosen on the
+ author's behalf. The directory also warns about the missing listing icon.
+ 
+ The validator checks registry schema/data, graph references, plugin manifests,
+-module links, and entrypoint routing. Unit tests include deliberately broken
++module links, and entrypoint routing. Pass optional `--previous-registry <snapshot>` to require the current `operations` ledger to retain the prior snapshot's entries as an exact prefix; this detects truncation, rewriting, and reordering, while a single snapshot cannot prove append-only history. Unit tests include deliberately broken
+ fixtures. These structural checks do not execute generated hooks or prove
+ semantic preservation.
+ 
+diff --git a/REGISTRY.schema.json b/REGISTRY.schema.json
+index 905700c..43cea8a 100644
+--- a/REGISTRY.schema.json
++++ b/REGISTRY.schema.json
+@@ -29,6 +29,7 @@
+     },
+     "operations": {
+       "type": "array",
++      "description": "Append-only operation ledger. Existing entries MUST remain unchanged and in order; new entries are appended. The ledger is excluded from the managed registry projection and from restoration, so rollback restores managed state by appending a rollback operation rather than truncating or rewriting history. A single snapshot cannot prove append-only history; supply a prior snapshot for prefix validation.",
+       "items": { "$ref": "#/$defs/operation" }
+     }
+   },
+@@ -234,7 +235,13 @@
+         "before_mode": { "type": ["integer", "null"] },
+         "after_mode": { "type": ["integer", "null"] },
+         "before_symlink": { "type": ["string", "null"] },
+-        "after_symlink": { "type": ["string", "null"] }
++        "after_symlink": { "type": ["string", "null"] },
++        "hash_scope": {
++          "type": "string",
++          "enum": ["file-bytes", "registry-managed-state"],
++          "default": "file-bytes",
++          "description": "Scope of before_sha256 and after_sha256. 'file-bytes' covers the raw file contents. 'registry-managed-state' covers the canonical managed registry projection (top-level registry state excluding the append-only operations ledger) and is used for registry snapshots."
++        }
+       }
+     },
+     "operation": {
+diff --git a/core/registry.md b/core/registry.md
+index 27413ff..ad05fa4 100644
+--- a/core/registry.md
++++ b/core/registry.md
+@@ -79,6 +79,37 @@ rollback detect support-file drift without inventing a directory-hash format.
+ 
+ Store directed edges per `core/dependencies.md`. Runtime-critical edges must be distinguishable from informational relationships.
+ 
++## Managed state and append-only ledger
++
++`registry.json` is a mixed file, not a whole-file rollback unit. Its managed
++projection is the complete parsed top-level mapping with only `operations`
++removed (including unknown or invalid managed fields). `operations` is an
++append-only ledger: preserve every committed entry unchanged and in order,
++including the target operation, then append a successful rollback entry.
++Rollback restores recorded managed prestate, not historical ledger contents.
++
++For registry before/after fingerprints, SHA-256 the UTF-8 canonical JSON of that
++projection: recursively sort object keys, preserve array order and JSON values,
++use compact separators (`,` and `:`), escape non-ASCII characters (`ensure_ascii=True`), reject non-finite
++numbers, and include no whitespace or trailing newline. Record this hash scope
++as `registry-managed-state`; other files use `file-bytes` and exact bytes.
++Never use a whole-registry byte hash as a rollback applicability check.
++
++Retain full original registry bytes in the patch as a forensic before-image,
++but restore and verify the managed projection, merging the live ledger rather
++than overwriting the registry with those bytes. This also applies to failure
++recovery. Even a registry initialized by an operation retains its committed
++ledger after rollback; an absent managed prestate is represented as an empty
++projection, not deletion of history. The resulting ledger-only mapping may be
++schema-invalid; report this expected recorded managed snapshot without claiming
++full validity or blocking faithful restoration solely for that reason.
++
++`audit --fix` may repair a parseable JSON mapping with invalid managed fields.
++Its patch preserves those known invalid fields in the managed before-projection;
++rollback may restore them while retaining the live ledger. The existing
++`operations` value MUST be a parseable list whose entries/history can be
++preserved unchanged; otherwise block mutation, never reset or invent history.
++
+ ## Operation history
+ 
+ Mutating operations record:
+diff --git a/core/transactions.md b/core/transactions.md
+index 79e179a..e879484 100644
+--- a/core/transactions.md
++++ b/core/transactions.md
+@@ -35,13 +35,14 @@ Commit order:
+ 10. revalidate committed state;
+ 11. delete only source roots explicitly marked disposable: every explicitly supplied local `recompose` or `integrate` source so classified MUST be deleted automatically under `procedures/source-discovery.md`, without additional authorization;
+ 12. run safe garbage collection;
+-13. validate once more.
++13. validate once more;
++14. validate the candidate committed operation entry and full proposed ledger, then atomically persist its append to live `registry.operations` only after all validation succeeds; preserve the existing ledger prefix unchanged. A persistence failure must never partially write or truncate history.
+ 
+ Steps 11-12 are part of the planned change set: their effects MUST already be represented in the patch created at step 7. If an unplanned change becomes necessary, abort, recompute the change set, and create a replacement patch before continuing.
+ 
+ If failure occurs before step 8, do not delete source roots; remove operation-owned state created for the aborted attempt — partial patch-container state, operation metadata, snapshots, and any generated interactive intent document — and leave the managed library and registry untouched. If that cleanup fails, retain the partial metadata and snapshot for recovery and diagnosis.
+ 
+-If failure occurs after mutation begins, reverse-apply the operation patch to restore the pre-operation filesystem and registry state using the patch's before-images, not any external snapshot; verify restored hashes/metadata. Only after restoration verifies successfully may partial metadata be cleaned up. Never remove the recovery patch or its metadata before that verification. If recovery fails, retain the patch and metadata for further recovery and diagnosis, report the exact unrecovered paths and registry state, and stop further mutation. Record the operation as failed rather than committed; record the failure diagnostic outside the payload, or report it inline when operation metadata was cleaned up. Do not delete source roots except as reversed by that patch.
++If failure occurs after mutation begins, reverse-apply the operation patch to restore the pre-operation filesystem and registry state using the patch's before-images, not any external snapshot; restore the registry managed projection merged with the live ledger, and verify projection digests plus other files' exact-byte hashes/metadata. Never truncate committed ledger entries, even during cleanup. Only after restoration verifies successfully may partial metadata be cleaned up. Never remove the recovery patch or its metadata before that verification. If recovery fails, retain the patch and metadata for further recovery and diagnosis, report the exact unrecovered paths and registry state, and stop further mutation. Record the operation as failed rather than committed; record the failure diagnostic outside the payload, or report it inline when operation metadata was cleaned up. Do not delete source roots except as reversed by that patch.
+ 
+ ## Single-file rollback package
+ 
+@@ -71,7 +72,7 @@ The patch payload is independent of Git and MUST capture every reversible manage
+ 
+ The operation's own patch container and operation metadata directory are not payload entries. The manifest describes payload entries and operation metadata, but metadata itself — including repair snapshots and failure/recovery records — is stored outside the payload in `<STATE_ROOT>/history/<operation-id>/`; `file_changes` metadata describes payload-managed mutations and excludes those locations.
+ 
+-A repair patch MUST retain the original invalid registry bytes as a before-image in the payload. Rollback and recovery use patch before-images and MUST NOT depend on an external repair snapshot.
++A repair patch MUST retain the original invalid registry bytes as a before-image in the payload for forensics. Rollback and recovery use patch before-images and MUST NOT depend on an external repair snapshot; registry restoration uses the managed projection merged with the live ledger, never whole-file overwrite, per `core/registry.md`.
+ 
+ A recommended layout is:
+ 
+@@ -86,7 +87,7 @@ Use unified text diffs where safe. Store binary or metadata-sensitive before/aft
+ 
+ ## Hashes and metadata
+ 
+-Registry operation metadata MUST record before/after SHA-256 hashes and relevant file metadata for every changed artifact.
++Registry operation metadata MUST record before/after SHA-256 hashes and relevant file metadata for every changed artifact. Other files use exact bytes (`file-bytes`); the registry uses canonical managed-projection digests (`registry-managed-state`) excluding top-level `operations`, per `core/registry.md`. Full registry bytes are forensic payload only, not rollback hashes or restoration units.
+ 
+ Use `null` when a path did not exist in the corresponding state.
+ 
+@@ -96,9 +97,9 @@ Never reverse blindly. Verify current paths/hashes/modes/symlink state match exp
+ 
+ If current state diverged, stop instead of overwriting newer work.
+ 
+-A rollback restores the recorded prestate exactly. If the target operation repaired a previously invalid registry, the restored prestate may carry those known pre-existing defects; report them faithfully rather than silently repairing the restored snapshot or treating faithful restoration as failed solely because of them.
++A rollback restores recorded managed prestate, excluding the append-only ledger: exact bytes for other files, canonical managed projection for the registry (`core/registry.md`). Merge the live ledger and append the validated rollback entry after successful restoration validation; never truncate committed entries. If the target operation repaired a previously invalid registry, the restored prestate may carry those known pre-existing defects; report them faithfully rather than silently repairing the restored snapshot or treating faithful restoration as failed solely because of them.
+ 
+-Later operations that depend on the target operation, or that overlap any of its changed paths or affected artifact/topic ids, must be rolled back first or otherwise resolved safely.
++Later operations that depend on the target operation, or that overlap its managed changes or affected artifact/topic ids, must be resolved safely first. The shared registry path alone is not a conflict for unrelated ledger-only appends. Any managed-projection drift blocks rollback, including otherwise unrelated managed edits; never erase newer managed state.
+ 
+ ## Ephemeral acquisition and intent inputs
+ 
+diff --git a/evals/README.md b/evals/README.md
+index 65366d6..6695c44 100644
+--- a/evals/README.md
++++ b/evals/README.md
+@@ -42,7 +42,15 @@ estimates. Human review was deferred at the user's request for autonomous work.
+ 
+ Cases 5–6 cover repair of parseable invalid state versus unreadable state, and
+ self-exclusion/cleanup of transaction metadata for ordinary changes and rollback.
+-These are plan-level assertions, not proof that a transaction engine ran.
++Cases 7–8 cover automatic consumption of explicit disposable local inputs for
++both mutation modes. Case 9 covers managed-state restoration while preserving
++and extending the operation ledger. These added scenarios are plan-level
++assertions, not proof that a transaction engine ran.
++
++Transition validation can compare a registry with a prior trusted snapshot using
++`--previous-registry`; a single snapshot cannot prove append-only history.
++Unit tests exercise projection digests and rejection of ledger truncation,
++rewriting, and reordering.
+ 
+ The deterministic repository tests are separate: run
+ `python -m unittest discover -s tests -v` after installing
+diff --git a/evals/evals.json b/evals/evals.json
+index 9aac388..7729052 100644
+--- a/evals/evals.json
++++ b/evals/evals.json
+@@ -25,9 +25,9 @@
+     {
+       "id": 4,
+       "prompt": "The managed registry exists. Recompose has staged replacement topics, and reachability analysis identified old source files and unused support files for deletion. Explain when you compute and capture those deletions, what happens if validation fails after activation, and how a later rollback itself stays reversible. Read relevant modules, do not modify the machine, save response.md.",
+-      "expected_output": "Complete mutation set includes source/GC deletions before patch; failure restores pre-state; rollback captures its own inverse patch.",
++      "expected_output": "Complete mutation set includes source/GC deletions before patch; failure restores managed pre-state without truncating committed operation history; rollback captures its own inverse patch.",
+       "files": [],
+-      "assertions": ["Includes source and garbage-collection deletions in the patch before mutation", "Restores pre-state if post-activation validation fails", "Creates a reversible patch for rollback itself"]
++      "assertions": ["Includes source and garbage-collection deletions in the patch before mutation", "Restores managed pre-state if post-activation validation fails while preserving committed ledger entries", "Creates a reversible patch for rollback itself"]
+     },
+     {
+       "id": 5,
+@@ -56,6 +56,13 @@
+       "expected_output": "Integration automatically deletes the explicit disposable local input after validated commit, with invocation authorization alone; all protected or unsuccessful cases retain sources.",
+       "files": [],
+       "assertions": ["Explicit disposable integrate input MUST be deleted automatically after successful validated commit", "No second confirmation, deletion flag, or separate authorization is required", "Dry-run and failed or uncommitted operations leave sources untouched", "Broad repositories, intent documents, unknown ownership, and unsafe consumers prevent consumed-source deletion"]
++    },
++    {
++      "id": 9,
++      "prompt": "An operation changed a topic and appended operation A to registry.operations. A later unrelated operation B appended another ledger record. Roll back A, recording rollback R. Explain what managed state and ledger remain, how registry hashes avoid ledger-only conflicts, and why restoring original registry bytes wholesale is incorrect. Do not modify real files; save response.md.",
++      "expected_output": "Restores A's recorded managed pre-state, preserves ledger A and B, appends R, checks managed registry projection independently of ledger and blocks genuine affected-state conflicts.",
++      "files": [],
++      "assertions": ["Preserves every existing ledger entry in order and appends rollback as a new operation", "Explicitly excludes registry.operations from exact managed pre-state restoration", "Uses registry-managed-state projection rather than full registry bytes for rollback preconditions", "Retains unrelated history without ignoring genuine overlapping managed-state changes"]
+     }
+   ]
+ }
+diff --git a/operations/audit.md b/operations/audit.md
+index 6616b76..c49a0b9 100644
+--- a/operations/audit.md
++++ b/operations/audit.md
+@@ -39,7 +39,7 @@ Topic rebalance analysis is included.
+ 
+ Non-dry-run `--fix` is a mutating operation: it requires an existing registry, creates an operation patch, and never seeds a new registry. If state is missing, report it and stop.
+ 
+-A parseable registry that is invalid or inconsistent MAY be diagnosed and repaired transactionally. The operation patch MUST retain the original invalid registry bytes as its before-image, so rollback and recovery use the patch payload and never depend on an external snapshot. Before repair, also capture the invalid registry in a readable, recoverable snapshot stored outside the patch payload for diagnosis. If the registry is unreadable or cannot be recovered, report it and stop without mutation.
++A parseable registry that is invalid or inconsistent MAY be diagnosed and repaired transactionally. The operation patch MUST retain the original invalid registry bytes as its before-image for forensics, so rollback and recovery use the patch payload and never depend on an external snapshot. Repair requires a parsed JSON mapping and an `operations` list whose existing history can be preserved unchanged; otherwise stop without mutation. Per `core/registry.md`, restoration uses the recorded managed projection excluding top-level `operations`, preserves known invalid managed fields, and merges the live append-only ledger; never whole-file overwrite the registry or reset history. Before repair, also capture the invalid registry in a readable, recoverable snapshot stored outside the patch payload for diagnosis. If the registry is unreadable or cannot be recovered, report it and stop without mutation.
+ 
+ Apply minimal necessary change and full impact analysis. Runtime/public interfaces must follow the same contract migration rules as `integrate`.
+ 
+diff --git a/operations/rollback.md b/operations/rollback.md
+index e1492f4..eb8bbc4 100644
+--- a/operations/rollback.md
++++ b/operations/rollback.md
+@@ -19,18 +19,18 @@ Load the core kernel plus:
+ 
+ Locate `<STATE_ROOT>/history/<operation-id>/operation.srpatch` and its operation record.
+ 
+-Verify current affected paths match expected post-operation hashes and metadata.
++Verify current affected paths match expected post-operation hashes and metadata: exact bytes for other files; the canonical managed-projection digest for `registry.json`, excluding top-level `operations`, per `core/registry.md`. Preserve the live ledger unchanged.
+ 
+-Inspect later operations for dependencies on entities or contracts introduced/modified by the target operation. Refuse unsafe out-of-order rollback. A later operation also depends on the target when its recorded file-change paths overlap the target's changed paths, or when its created/modified/deleted artifact or topic ids overlap the target's affected ids.
++Inspect later operations for dependencies on entities or contracts introduced/modified by the target operation. Refuse unsafe out-of-order rollback. A later operation also depends on the target when its recorded file-change paths overlap the target's changed paths, or when its created/modified/deleted artifact or topic ids overlap the target's affected ids. The shared registry path alone is not overlap when only unrelated ledger entries were appended. Any managed-projection drift from the target's expected after-state blocks rollback, even for otherwise unrelated managed edits; restoring the whole projection must not erase them.
+ 
+ ## Behavior
+ 
+ Dry-run reports applicability, the exact reverse change set, the proposed rollback operation record, and the rollback patch that would be created; it writes nothing.
+ 
+-Non-dry-run first creates its own reversible patch container at `<STATE_ROOT>/history/<rollback-operation-id>/operation.srpatch`, covering the managed reverse changes but excluding its own patch container and operation metadata directory; the new operation record is metadata outside the payload. It then reverse-applies the target patch container, restoring source units and prior managed state encoded by the operation, and verifies the exact recorded prestate hashes and metadata.
++Non-dry-run first creates its own reversible patch container at `<STATE_ROOT>/history/<rollback-operation-id>/operation.srpatch`, covering the managed reverse changes but excluding its own patch container and operation metadata directory; the new operation record is metadata outside the payload. It then reverse-applies the target patch container, restoring source units and prior managed state encoded by the operation, and verifies the recorded managed prestate: canonical registry projection digest merged with the unchanged live ledger, exact-byte hashes and metadata for other files. Never replace the registry from its forensic full-byte before-image.
+ 
+-For a rollback of `audit --fix`, the restored registry MAY be the originally invalid registry by design. Report known pre-existing schema or integrity errors faithfully without pretending the registry is valid, silently altering the restored snapshot, or blocking faithful restoration solely because of those pre-existing defects. The current pre-rollback state must still satisfy the existing valid-state precondition.
++For a rollback of `audit --fix`, the restored managed projection MAY contain the original invalid managed fields by design, while the live ledger survives unchanged. Report known pre-existing schema or integrity errors faithfully without pretending the registry is valid, silently altering the restored snapshot, or blocking faithful restoration solely because of those pre-existing defects. The current pre-rollback state must still satisfy the existing valid-state precondition.
+ 
+-It records a new operation with mode `rollback`, `patch_path` pointing to the rollback patch, and `sources` naming the rolled-back operation id.
++After restoration validation, validate a new operation entry with mode `rollback`, `patch_path` pointing to the rollback patch, and `sources` naming the rolled-back operation id, plus the full proposed ledger. Atomically append it to the live ledger without changing any prior committed entry. Persistence or cleanup must never truncate history. An originally absent managed prestate yields a ledger-only mapping; report its expected schema invalidity as recorded, just like known invalid managed fields from repair.
+ 
+-Never partially rollback when preconditions fail. On failure before mutation begins, remove partial rollback metadata and container state created for the attempt; retain them if cleanup fails. If reverse application fails after mutation begins, restore the pre-rollback state from the rollback patch's before-images and verify restored hashes/metadata before reporting failure. Only after successful restoration verification may partial metadata be cleaned up; never remove the recovery patch or its metadata first, and retain them if recovery fails.
++Never partially rollback when preconditions fail. On failure before mutation begins, remove partial rollback metadata and container state created for the attempt; retain them if cleanup fails. If reverse application fails after mutation begins, restore the pre-rollback managed state from the rollback patch's before-images, merging the live ledger, and verify projection digests plus other files' exact-byte hashes/metadata before reporting failure. Never remove or rewrite committed ledger entries. Only after successful restoration verification may partial metadata be cleaned up; never remove the recovery patch or its metadata first, and retain them if recovery fails.
+diff --git a/procedures/patching.md b/procedures/patching.md
+index 73aa16a..3ce0cf7 100644
+--- a/procedures/patching.md
++++ b/procedures/patching.md
+@@ -26,7 +26,7 @@ The patch payload MUST represent every managed filesystem change caused by the o
+ 
+ The payload MUST exclude the operation's own patch container and operation metadata directory. The manifest may describe payload entries, but metadata runs outside the payload: repair snapshots and failure/recovery records live in `<STATE_ROOT>/history/<operation-id>/`, and `file_changes` metadata describes payload-managed mutations while excluding those locations.
+ 
+-A repair patch MUST retain the original invalid registry bytes as a before-image in the payload. Rollback and recovery use patch before-images and MUST NOT depend on an external repair snapshot.
++A repair patch MUST retain the original invalid registry bytes as a before-image in the payload for forensic recovery. Rollback and recovery use patch before-images and MUST NOT depend on an external repair snapshot, but restore only the registry managed projection, merging the live `operations` ledger, per `core/registry.md`; never whole-file overwrite the registry. Known invalid managed fields remain part of that recorded projection.
+ 
+ ## Failure cleanup
+ 
+@@ -38,7 +38,7 @@ If mutation began before failure, restore from the patch before-images and verif
+ 
+ Use a single archive with a machine-readable manifest.
+ 
+-For text files, prefer reversible unified diffs plus before/after hashes.
++For text files other than the mixed registry, prefer reversible unified diffs plus exact-byte before/after hashes. For the registry, store before/after managed projections and their canonical digests (`registry-managed-state`) plus full bytes for forensics; merge the live ledger during restoration (`core/registry.md`). Do not apply a whole-file registry diff or use its byte hash as a rollback precondition.
+ 
+ For binary or metadata-sensitive artifacts, include the minimum before/after payload needed for exact reversal.
+ 
+@@ -59,10 +59,12 @@ A rollback patch follows the same payload and metadata exclusion: it covers mana
+ Before reverse application:
+ 
+ 1. verify operation id and manifest integrity;
+-2. verify current path hashes and metadata equal expected after-state;
++2. verify current path hashes and metadata equal expected after-state (registry managed-projection digest, other files' exact bytes); any managed-projection drift blocks rollback; unrelated ledger-only appends and the shared registry path alone do not create dependency conflicts;
+ 3. verify no later operation depends on the target state;
+ 4. apply the patch completely in reverse;
+-5. verify expected before-state hashes/metadata;
+-6. validate the restored registry and runtime graph against the expected prestate; when that prestate contains known pre-existing invalidity from an `audit --fix` repair, report those defects faithfully without silently correcting them or treating faithful restoration as failed solely because of them.
++5. verify expected managed before-state (canonical registry projection digest, other files' exact-byte hashes/metadata), preserving the live ledger;
++6. validate the restored registry and runtime graph against the expected prestate; when that prestate contains known pre-existing invalidity from an `audit --fix` repair, or an absent managed prestate leaves a ledger-only mapping, report that expected schema/integrity invalidity faithfully without silently correcting it or treating faithful restoration as failed solely because of it.
++
++After restoration validation, validate the rollback entry and proposed ledger, then atomically append it without changing existing entries. Cleanup and recovery MUST NOT truncate committed history; registry recovery merges its managed projection with the live ledger, never overwrites full bytes.
+ 
+ If any precondition fails, abort without partial application.
+diff --git a/scripts/validate_repository.py b/scripts/validate_repository.py
+index 296cb2d..d94f30c 100644
+--- a/scripts/validate_repository.py
++++ b/scripts/validate_repository.py
+@@ -12,6 +12,7 @@ Checks are intentionally structural:
+ from __future__ import annotations
+ 
+ import argparse
++import hashlib
+ import json
+ import re
+ import sys
+@@ -179,7 +180,86 @@ def validate_registry_semantics(registry: Any) -> list[str]:
+     return errors
+ 
+ 
+-def validate_registry_file(registry_path: Path, schema_path: Path) -> list[str]:
++def managed_registry_projection(registry: Any) -> dict[str, Any]:
++    """Return managed registry state: all top-level fields except the operation ledger."""
++    if not isinstance(registry, dict):
++        raise TypeError("registry must be a JSON object")
++    return {key: value for key, value in registry.items() if key != "operations"}
++
++
++def managed_registry_digest(registry: Any) -> str:
++    """Return the deterministic SHA-256 digest of the managed registry projection."""
++    canonical = json.dumps(
++        managed_registry_projection(registry),
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=True,
++        allow_nan=False,
++    )
++    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
++
++
++def validate_operation_history(
++    registry: Any,
++    previous: Any,
++    registry_label: str = "registry",
++    previous_label: str = "previous registry",
++) -> list[str]:
++    """Check that previous operations remain an exact prefix of current operations.
++
++    Comparing two snapshots detects truncation, rewriting, and reordering
++    relative to the supplied previous snapshot. It does not prove append-only
++    history for a ledger observed in isolation, and new unique entries are
++    permitted.
++    """
++    if not isinstance(previous, dict):
++        return [f"{previous_label}: previous registry must be a JSON object"]
++    current_operations = registry.get("operations") if isinstance(registry, dict) else None
++    previous_operations = previous.get("operations")
++    if not isinstance(previous_operations, list):
++        return [f"{previous_label}: operations must be a list"]
++    if not isinstance(current_operations, list):
++        return [f"{registry_label}: operations must be a list"]
++
++    errors = []
++    for index, expected in enumerate(previous_operations):
++        if index >= len(current_operations):
++            errors.append(
++                f"{registry_label}: operations ledger truncated; previous operation at index "
++                f"{index} is missing"
++            )
++            break
++        if current_operations[index] != expected:
++            errors.append(
++                f"{registry_label}: operations[{index}] differs from {previous_label}; "
++                "existing operations must remain unchanged and in order"
++            )
++            break
++    if errors:
++        return errors
++
++    seen: set[str] = set()
++    for operation in current_operations:
++        if not isinstance(operation, dict):
++            continue
++        operation_id = operation.get("operation_id")
++        if not isinstance(operation_id, str):
++            continue
++        if operation_id in seen:
++            errors.append(
++                f"{registry_label}: duplicate operation id {operation_id!r}; "
++                "appended operations must be unique"
++            )
++            continue
++        seen.add(operation_id)
++    return errors
++
++
++def validate_registry_file(
++    registry_path: Path,
++    schema_path: Path,
++    previous_registry_path: Path | None = None,
++) -> list[str]:
+     registry, errors = _load_json(registry_path)
+     if registry is None:
+         return errors
+@@ -198,6 +278,24 @@ def validate_registry_file(registry_path: Path, schema_path: Path) -> list[str]:
+         errors.append(f"{registry_path}:{_json_error_location(error)}: {error.message}")
+     if not errors:
+         errors.extend(validate_registry_semantics(registry))
++
++    if previous_registry_path is not None:
++        previous, previous_errors = _load_json(previous_registry_path)
++        errors.extend(previous_errors)
++        if not previous_errors:
++            if not isinstance(previous, dict):
++                errors.append(
++                    f"{previous_registry_path}: previous registry must be a JSON object"
++                )
++            elif not errors:
++                errors.extend(
++                    validate_operation_history(
++                        registry,
++                        previous,
++                        str(registry_path),
++                        str(previous_registry_path),
++                    )
++                )
+     return errors
+ 
+ 
+@@ -464,11 +562,15 @@ def validate_markdown_references(root: Path) -> list[str]:
+     return errors
+ 
+ 
+-def validate_repository(root: Path) -> list[str]:
++def validate_repository(
++    root: Path, previous_registry_path: Path | None = None
++) -> list[str]:
+     schema_path = root / SCHEMA_REL
+     errors: list[str] = []
+     errors.extend(validate_schema_file(schema_path))
+-    errors.extend(validate_registry_file(root / REGISTRY_REL, schema_path))
++    errors.extend(
++        validate_registry_file(root / REGISTRY_REL, schema_path, previous_registry_path)
++    )
+     errors.extend(validate_plugin_manifests(root))
+     errors.extend(validate_markdown_references(root))
+     errors.extend(validate_entrypoint(root))
+@@ -483,10 +585,15 @@ def main(argv: list[str] | None = None) -> int:
+         default=Path(__file__).resolve().parent.parent,
+         help="TOOL_ROOT to validate (default: repository containing this script)",
+     )
++    parser.add_argument(
++        "--previous-registry",
++        type=Path,
++        help="prior registry snapshot whose operations must remain an exact prefix",
++    )
+     args = parser.parse_args(argv)
+     root = args.root.resolve()
+ 
+-    errors = validate_repository(root)
++    errors = validate_repository(root, args.previous_registry)
+     for error in errors:
+         print(error, file=sys.stderr)
+     if errors:
+diff --git a/skills/skill-recomposer/SKILL.md b/skills/skill-recomposer/SKILL.md
+index 4571219..b67a07e 100644
+--- a/skills/skill-recomposer/SKILL.md
++++ b/skills/skill-recomposer/SKILL.md
+@@ -49,7 +49,11 @@ Select the operation before touching state.
+   repaired only by transactional `audit --fix`, using a readable recoverable
+   snapshot. The patch retains the original invalid registry bytes as a
+   before-image, so rollback and recovery use the patch, not the snapshot. An
+-  unreadable or unrecoverable registry blocks repair. Missing state is never
++  unreadable or unrecoverable registry blocks repair. Repair requires a parsed
++  JSON mapping and an `operations` list whose history can be preserved unchanged;
++  invalid managed fields may be repaired, but ledger loss/reset is forbidden.
++  Full bytes are forensic; restoration uses the managed projection excluding
++  `operations`, merged with the live append-only ledger (`core/registry.md`). Missing state is never
+   replaced with the seed.
+ - `rollback` requires an existing valid registry and recorded operation. Missing
+   state is an error, not a reason to initialize an empty registry.
+@@ -64,7 +68,12 @@ Select the operation before touching state.
+ 
+ Ordinary mutating operations other than `audit --fix` require a valid registry
+ and block on invalid or inconsistent state. Preserve invalid state for diagnosis
+-rather than replacing it with the seed. Never mutate the seed registry in
++rather than replacing it with the seed. All rollback/recovery checks use canonical
++registry managed-projection digests, not whole-file hashes; preserve and merge
++live `operations`, never truncate committed entries during cleanup, and append
++a committed entry atomically only after state, entry, and proposed-ledger validation.
++Ledger-only appends do not conflict at the shared path; any managed-projection
++drift blocks rollback. Other files restore exact bytes. Never mutate the seed registry in
+ `TOOL_ROOT`.
+ 
+ ## Load the kernel
+diff --git a/tests/test_repository.py b/tests/test_repository.py
+index cde6eb6..a42ba90 100644
+--- a/tests/test_repository.py
++++ b/tests/test_repository.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import contextlib
++import io
+ import json
+ import sys
+ import tempfile
+@@ -365,6 +367,230 @@ class RegistryValidationTests(RepositoryTestCase):
+         errors = validator.validate_registry_semantics(registry)
+         self.assert_error_contains(errors, "unsupported from_id", "not edge ids")
+ 
++    def operation(self, operation_id, mode="recompose", file_changes=None, **overrides):
++        operation = {
++            "operation_id": operation_id,
++            "mode": mode,
++            "sources": [],
++            "target_topic_id": None,
++            "created_artifact_ids": [],
++            "modified_artifact_ids": [],
++            "deleted_artifact_ids": [],
++            "created_topic_ids": [],
++            "modified_topic_ids": [],
++            "deleted_topic_ids": [],
++            "deleted_source_paths": [],
++            "patch_path": None,
++            "file_changes": file_changes or [],
++            "timestamp": "2026-01-01T00:00:00Z",
++        }
++        operation.update(overrides)
++        return operation
++
++    def file_change(self, hash_scope=None):
++        change = {
++            "path": "skills/example/SKILL.md",
++            "change_type": "modify",
++            "before_sha256": "a" * 64,
++            "after_sha256": "b" * 64,
++        }
++        if hash_scope is not None:
++            change["hash_scope"] = hash_scope
++        return change
++
++    def registry_with_operations(self, *operations):
++        registry = json.loads(json.dumps(self.registry))
++        registry["operations"] = list(operations)
++        return registry
++
++    def test_previous_snapshot_preserved_prefix_and_new_entries_are_accepted(self):
++        previous = {"operations": [self.operation("op-1")]}
++        current = {
++            "operations": [self.operation("op-1"), self.operation("op-2")]
++        }
++        self.assertEqual(validator.validate_operation_history(current, previous), [])
++
++    def test_previous_snapshot_truncation_is_rejected(self):
++        previous = {
++            "operations": [self.operation("op-1"), self.operation("op-2")]
++        }
++        current = {"operations": [self.operation("op-1")]}
++        errors = validator.validate_operation_history(current, previous)
++        self.assert_error_contains(errors, "truncated")
++
++    def test_previous_snapshot_rewrite_is_rejected(self):
++        previous = {"operations": [self.operation("op-1")]}
++        current = {
++            "operations": [self.operation("op-1", sources=["rewritten-source"])]
++        }
++        errors = validator.validate_operation_history(current, previous)
++        self.assert_error_contains(errors, "differs", "unchanged and in order")
++
++    def test_previous_snapshot_reorder_is_rejected(self):
++        previous = {
++            "operations": [self.operation("op-1"), self.operation("op-2")]
++        }
++        current = {
++            "operations": [self.operation("op-2"), self.operation("op-1")]
++        }
++        errors = validator.validate_operation_history(current, previous)
++        self.assert_error_contains(errors, "differs", "unchanged and in order")
++
++    def test_duplicate_appended_operation_id_is_rejected(self):
++        previous = {"operations": [self.operation("op-1")]}
++        current = {"operations": [self.operation("op-1"), self.operation("op-1")]}
++        errors = validator.validate_operation_history(current, previous)
++        self.assert_error_contains(errors, "duplicate operation id")
++
++    def test_registry_file_checks_previous_snapshot(self):
++        previous_path = self.root / "previous.json"
++        registry_path = self.root / "registry.json"
++        write_json(
++            previous_path, self.registry_with_operations(self.operation("op-1"))
++        )
++        write_json(
++            registry_path,
++            self.registry_with_operations(
++                self.operation("op-1"), self.operation("op-2")
++            ),
++        )
++        self.assertEqual(
++            validator.validate_registry_file(
++                registry_path, self.schema_path, previous_path
++            ),
++            [],
++        )
++
++        write_json(
++            previous_path,
++            self.registry_with_operations(
++                self.operation("op-1"), self.operation("op-2")
++            ),
++        )
++        write_json(
++            registry_path, self.registry_with_operations(self.operation("op-1"))
++        )
++        errors = validator.validate_registry_file(
++            registry_path, self.schema_path, previous_path
++        )
++        self.assert_error_contains(errors, "truncated")
++
++    def test_cli_accepts_previous_registry(self):
++        make_valid_repository(self.root)
++        previous_path = self.root / "previous.json"
++        write_json(previous_path, self.registry)
++        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
++            io.StringIO()
++        ):
++            status = validator.main(
++                ["--root", str(self.root), "--previous-registry", str(previous_path)]
++            )
++        self.assertEqual(status, 0)
++
++    def test_managed_registry_projection_excludes_operations(self):
++        registry = self.registry_with_operations(self.operation("op-1"))
++        projection = validator.managed_registry_projection(registry)
++        self.assertNotIn("operations", projection)
++        self.assertEqual(
++            projection,
++            {key: value for key, value in registry.items() if key != "operations"},
++        )
++
++    def test_managed_registry_digest_ignores_ledger_appends(self):
++        first = self.registry_with_operations(
++            self.operation("op-1", file_changes=[self.file_change()])
++        )
++        second = self.registry_with_operations(
++            self.operation("op-1", file_changes=[self.file_change()]),
++            self.operation("op-2"),
++        )
++        self.assertEqual(
++            validator.managed_registry_digest(first),
++            validator.managed_registry_digest(second),
++        )
++
++    def test_managed_registry_digest_uses_escaped_canonical_json(self):
++        registry = {
++            "schema_version": 2,
++            "operation_name": "café",
++            "operations": [self.operation("op-1")],
++        }
++        self.assertEqual(
++            validator.managed_registry_digest(registry),
++            "740ef70d1786bb307fad0cde7d3858d8ede4469f9faffcef9386db642e6058df",
++        )
++
++    def test_managed_registry_digest_rejects_nonfinite_values(self):
++        registry = self.registry_with_operations()
++        registry["metric"] = float("nan")
++        with self.assertRaises(ValueError):
++            validator.managed_registry_digest(registry)
++
++    def test_managed_registry_digest_tracks_managed_state(self):
++        first = self.registry_with_operations()
++        second = self.registry_with_operations()
++        second["operation_name"] = "changed"
++        self.assertNotEqual(
++            validator.managed_registry_digest(first),
++            validator.managed_registry_digest(second),
++        )
++
++    def test_rollback_merge_restores_managed_projection_and_keeps_ledger(self):
++        saved = self.registry_with_operations(self.operation("op-1"))
++        saved_digest = validator.managed_registry_digest(saved)
++
++        current = self.registry_with_operations(
++            self.operation("op-1"), self.operation("op-2")
++        )
++        current["topics"] = [{"id": "drifted-topic"}]
++        self.assertNotEqual(
++            validator.managed_registry_digest(current), saved_digest
++        )
++
++        restored = validator.managed_registry_projection(saved)
++        restored["operations"] = current["operations"] + [
++            self.operation("op-rollback", mode="rollback")
++        ]
++
++        self.assertEqual(validator.managed_registry_digest(restored), saved_digest)
++        self.assertEqual(validator.validate_operation_history(restored, saved), [])
++        self.assertEqual(validator.validate_operation_history(restored, current), [])
++        self.assertEqual(
++            [operation["operation_id"] for operation in restored["operations"]],
++            ["op-1", "op-2", "op-rollback"],
++        )
++        self.assertEqual(restored["topics"], saved["topics"])
++
++    def test_file_change_hash_scope_defaults_to_file_bytes(self):
++        registry_path = self.root / "registry.json"
++        for scope in (None, "file-bytes", "registry-managed-state"):
++            with self.subTest(scope=scope):
++                write_json(
++                    registry_path,
++                    self.registry_with_operations(
++                        self.operation(
++                            "op-1", file_changes=[self.file_change(scope)]
++                        )
++                    ),
++                )
++                self.assertEqual(
++                    validator.validate_registry_file(registry_path, self.schema_path),
++                    [],
++                )
++
++    def test_unknown_file_change_hash_scope_is_rejected(self):
++        registry_path = self.root / "registry.json"
++        write_json(
++            registry_path,
++            self.registry_with_operations(
++                self.operation(
++                    "op-1", file_changes=[self.file_change("raw-bytes")]
++                )
++            ),
++        )
++        errors = validator.validate_registry_file(registry_path, self.schema_path)
++        self.assert_error_contains(errors, "hash_scope")
++
+ 
+ class PluginManifestTests(RepositoryTestCase):
+     def test_repository_manifests_are_valid(self):
+diff --git a/tests/test_workflow_contracts.py b/tests/test_workflow_contracts.py
+index 38dc49a..e507982 100644
+--- a/tests/test_workflow_contracts.py
++++ b/tests/test_workflow_contracts.py
+@@ -77,6 +77,17 @@ class WorkflowContractSpecTests(unittest.TestCase):
+         self.assertIn("delete sources", dry_run)
+         self.assertIn("Broad repositories and non-disposable sources remain protected", discovery)
+ 
++    def test_rollback_preserves_append_only_ledger(self):
++        registry = section("core/registry.md", "Managed state and append-only ledger")
++        self.assertIn("append-only ledger", registry)
++        self.assertIn("preserve every committed entry unchanged and in order", registry)
++        self.assertIn("append a successful rollback entry", registry)
++        self.assertIn("registry-managed-state", registry)
++        self.assertIn("merging the live ledger", registry)
++        rollback = section("operations/rollback.md", "Behavior")
++        self.assertIn("ledger", rollback)
++        self.assertIn("managed", rollback)
++
+     def test_existing_source_deletion_safeguards(self):
+         source = section("procedures/source-discovery.md", "6. Source deletion safety")
+         self.assertRegex(source, r"repository-or-broad-root.*MUST NOT be auto-deleted")
+-- 
+2.56.0
+

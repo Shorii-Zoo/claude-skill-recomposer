@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "skill-recomposition-registry.schema.json",
+  "title": "Skill Recomposition Registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operation_name",
+    "topics",
+    "artifacts",
+    "dependencies",
+    "operations"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 2 },
+    "operation_name": { "type": "string", "const": "skill-recomposition" },
+    "topics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/topic" }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "dependencies": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/dependency" }
+    },
+    "operations": {
+      "type": "array",
+      "description": "Append-only operation ledger. Existing entries MUST remain unchanged and in order; new entries are appended. The ledger is excluded from the managed registry projection and from restoration, so rollback restores managed state by appending a rollback operation rather than truncating or rewriting history. A single snapshot cannot prove append-only history; supply a prior snapshot for prefix validation.",
+      "items": { "$ref": "#/$defs/operation" }
+    }
+  },
+  "$defs": {
+    "invariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "statement"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "statement": { "type": "string", "minLength": 1 },
+        "rationale": { "type": "string" },
+        "source": { "type": "string" }
+      }
+    },
+    "styleProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "language": { "type": "string", "const": "en" },
+        "normative_style": { "type": "string", "minLength": 1 },
+        "tone": { "type": "string", "minLength": 1 },
+        "naming": { "type": "string", "minLength": 1 },
+        "heading_depth_max": { "type": "integer", "minimum": 1, "maximum": 6 },
+        "procedure_style": { "type": "string", "minLength": 1 },
+        "example_convention": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "strict": { "type": "string", "minLength": 1 },
+            "advisory": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "topic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "name",
+        "short_description",
+        "scope",
+        "glossary_path",
+        "style_profile",
+        "invariants",
+        "artifact_ids",
+        "items"
+      ],
+      "properties": {
+        "type": { "const": "topic" },
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "short_description": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "minLength": 1 },
+        "glossary_path": { "type": "string", "minLength": 1 },
+        "style_profile": { "$ref": "#/$defs/styleProfile" },
+        "invariants": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/invariant" }
+        },
+        "artifact_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/topic" }
+        }
+      }
+    },
+    "activation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "enum": ["model", "user", "event", "delegated", "external", "none", "unknown"]
+        },
+        "trigger": { "type": "string" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "path",
+        "short_description",
+        "scope",
+        "origin",
+        "created_by_operation_id",
+        "last_modified_by_operation_id"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": {
+          "enum": [
+            "skill",
+            "command",
+            "agent",
+            "hook",
+            "script",
+            "rule",
+            "config",
+            "reference",
+            "evaluation",
+            "adapter",
+            "unknown"
+          ]
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "short_description": { "type": "string", "minLength": 1 },
+        "scope": {
+          "enum": ["runtime", "distribution", "validation", "development", "documentation", "unknown"]
+        },
+        "primary_topic_id": { "type": ["string", "null"] },
+        "activation": { "$ref": "#/$defs/activation" },
+        "host": { "type": "string" },
+        "surface": { "type": "string" },
+        "origin": { "type": "string", "const": "skill-recomposition" },
+        "created_by_operation_id": { "type": "string", "minLength": 1 },
+        "last_modified_by_operation_id": { "type": "string", "minLength": 1 },
+        "source_lineage": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "provenance_path": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "interface_summary": { "type": "string" }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "from_id", "to_id", "relation", "runtime_critical"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "from_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Source graph endpoint. MUST be an existing topic id or artifact id, including skill artifacts. Operation ids and edge ids are not valid endpoints; add new entity types here and in core/dependencies.md when the graph is extended."
+        },
+        "to_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Target graph endpoint. MUST be an existing topic id or artifact id, including skill artifacts. Operation ids and edge ids are not valid endpoints; add new entity types here and in core/dependencies.md when the graph is extended."
+        },
+        "relation": {
+          "enum": [
+            "invokes",
+            "delegates-to",
+            "executes",
+            "triggered-by",
+            "loads",
+            "configures",
+            "wraps",
+            "adapts",
+            "exposes",
+            "reads",
+            "writes",
+            "uses",
+            "requires",
+            "complements",
+            "requires-knowledge-from",
+            "requires-policy-from",
+            "specializes",
+            "supersedes",
+            "tests",
+            "validates"
+          ]
+        },
+        "runtime_critical": { "type": "boolean" },
+        "rationale": { "type": "string" }
+      }
+    },
+    "fileChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "change_type", "before_sha256", "after_sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "old_path": { "type": "string" },
+        "change_type": { "enum": ["create", "modify", "delete", "move", "metadata"] },
+        "before_sha256": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+            { "type": "null" }
+          ]
+        },
+        "after_sha256": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+            { "type": "null" }
+          ]
+        },
+        "before_mode": { "type": ["integer", "null"] },
+        "after_mode": { "type": ["integer", "null"] },
+        "before_symlink": { "type": ["string", "null"] },
+        "after_symlink": { "type": ["string", "null"] },
+        "hash_scope": {
+          "type": "string",
+          "enum": ["file-bytes", "registry-managed-state"],
+          "default": "file-bytes",
+          "description": "Scope of before_sha256 and after_sha256. 'file-bytes' covers the raw file contents. 'registry-managed-state' covers the canonical managed registry projection (top-level registry state excluding the append-only operations ledger) and is used for registry snapshots."
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "mode",
+        "sources",
+        "target_topic_id",
+        "created_artifact_ids",
+        "modified_artifact_ids",
+        "deleted_artifact_ids",
+        "created_topic_ids",
+        "modified_topic_ids",
+        "deleted_topic_ids",
+        "deleted_source_paths",
+        "patch_path",
+        "file_changes",
+        "timestamp"
+      ],
+      "properties": {
+        "operation_id": { "type": "string", "minLength": 1 },
+        "mode": { "enum": ["recompose", "integrate", "audit-fix", "rollback"] },
+        "sources": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "target_topic_id": { "type": ["string", "null"] },
+        "created_artifact_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "modified_artifact_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "deleted_artifact_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "created_topic_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "modified_topic_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "deleted_topic_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "deleted_source_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "patch_path": { "type": ["string", "null"] },
+        "file_changes": {
+          "type": "array",
+          "description": "Managed filesystem mutations only. Excludes the operation's own patch container and operation metadata directory, whose contents live outside the payload. A transactional audit --fix repair snapshot is stored with operation metadata, while the patch retains the original invalid registry bytes as a before-image; rollback and recovery use the patch, not the external snapshot.",
+          "items": { "$ref": "#/$defs/fileChange" }
+        },
+        "timestamp": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}
