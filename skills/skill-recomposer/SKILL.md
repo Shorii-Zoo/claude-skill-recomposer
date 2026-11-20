@@ -4,10 +4,11 @@ description: >-
   Recompose overlapping Claude Code skills and their commands, agents, hooks,
   scripts, and references into a managed capability library. Use when the user
   asks to merge or deduplicate existing skills, integrate sources or intent into
-  that library, audit or check managed outputs, or roll back a managed operation.
+  that library, discover thematic candidates, maintain the discover blacklist,
+  audit or check managed outputs, or roll back a managed operation.
   Not for creating an unrelated skill from scratch or refactoring application code.
 disable-model-invocation: true
-argument-hint: "[recompose|integrate|audit|check|rollback] ..."
+argument-hint: "[recompose|integrate|audit|check|rollback|discover] ..."
 ---
 
 # Skill Recomposer
@@ -39,6 +40,9 @@ Treat `TOOL_ROOT` as read-only implementation resources. Registry, generated int
 
 Select the operation before touching state.
 
+- `discover` loads only `operations/discover.md` before any state bootstrap or core
+  mutation modules. It may read existing state but never seeds a registry. Blacklist
+  edits require an explicit user request; recomposition requires selection approval.
 - `check` and report-only `audit` are read-only: validate existing state if present. If the
   state directory or registry is missing, report that no managed state exists;
   do not create directories, seed a registry, or claim managed validation passed.
@@ -76,6 +80,12 @@ Ledger-only appends do not conflict at the shared path; any managed-projection
 drift blocks rollback. Other files restore exact bytes. Never mutate the seed registry in
 `TOOL_ROOT`.
 
+## Discovery shortcut
+
+For `discover` (including explicit natural-language discover-blacklist changes),
+load `operations/discover.md` and follow its approval gate. Do not load mutation
+modules or treat missing sources as default `recompose`.
+
 ## Load the kernel
 
 Read:
@@ -98,6 +108,7 @@ Do not load every other module up front.
 - `check` → `operations/check.md`
 - `audit` → `operations/audit.md`
 - `rollback` → `operations/rollback.md`
+- `discover` → `operations/discover.md`
 
 The operation file declares the remaining modules it needs.
 

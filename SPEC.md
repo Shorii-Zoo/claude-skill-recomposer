@@ -4,7 +4,7 @@ This file is a compatibility index. Do not load the whole specification by defau
 
 ## Core kernel
 
-Load for every operation:
+Load for managed operations (not the read-only `discover` shortcut):
 
 - `core/principles.md`
 - `core/architecture.md`
@@ -24,6 +24,7 @@ Load `core/style-structure.md`, `core/glossary.md`, and `core/host-layout.md` on
 - `operations/audit.md`
 - `operations/check.md`
 - `operations/rollback.md`
+- `operations/discover.md` — fast candidate grouping and explicit source approval
 
 ## Discovery and planning
 

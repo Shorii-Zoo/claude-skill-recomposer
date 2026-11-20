@@ -28,6 +28,152 @@ The core idea is simple:
 
 > **Preserve semantics and behavior, normalize structure, and produce focused capabilities with explicit execution policy.**
 
+## Discover recomposition candidates
+
+```text
+/skill-recomposer discover
+/skill-recomposer discover blacklist add plugin@marketplace
+/skill-recomposer discover blacklist remove plugin@marketplace
+/skill-recomposer discover blacklist list
+```
+
+Natural-language blacklist changes are supported through the skill. The persistent
+custom list lives at `~/.claude/skill-tools/skill-recomposer-state/discover-blacklist.json`.
+Self and managed-output exclusions cannot be removed through this list.
+
+Discovery reads installed plugin roots, applies mandatory/custom provenance filters,
+removes `ineligible` plugins (keeps `needs_review`), then clusters their instruction
+metadata alongside existing managed topic descriptions. Unmatched plugins are omitted;
+a plugin linked only to an existing topic remains. Every surviving candidate appears
+once, with name, short description and decision. Suggested groups are not final topics.
+Only explicit user selection authorizes the subsequent ordinary recomposition flow.
+
+Standalone CLI (no dependencies, model calls, plugin execution or network):
+
+```bash
+python -I scripts/discover_plugins.py
+python -I scripts/discover_plugins.py --json
+python -I scripts/discover_plugins.py --state-root /path/to/state blacklist add plugin@marketplace
+```
+
+Metadata clustering is deterministic and lexical, not a merge-compatibility guarantee.
+It uses manifest descriptions, per-entry descriptions and concise frontmatter names,
+sparse TF-IDF plus local subtheme overlap, and strongest-edge complete-link grouping
+(to avoid one broad bundle bridging unrelated domains). Text/segment/candidate caps
+bound work; lexical synonyms or capped subthemes can remain unmatched. No hand-coded
+plugin pairs or product taxonomy is used. Synthetic clustering of 5,000 records took
+about 0.12 seconds locally; full local discovery of 13 installations took about 3.5
+seconds, dominated by eligibility/content scanning.
+The JSON retains filtered identities and reasons for audit; ordinary output shows only
+the proposed groups and approval question. State is not bootstrapped by discovery.
+The annotation cache is reused automatically; a missing cache falls back to conservative
+static eligibility. Installed-but-disabled plugins are still candidates; effective
+session activation is not used as an eligibility signal.
+
+## Plugin metrics prototype
+
+Read-only observations and provisional deterministic eligibility decisions for entire
+local plugins. No confidence percentages, network requests, LLM calls, or execution
+of plugin code.
+
+```bash
+python -I scripts/extract_plugin_metrics.py --installed > /tmp/plugin-metrics.json
+python -I scripts/extract_plugin_metrics.py /path/to/plugin
+python -I -m unittest discover -s tests -p 'test_plugin_metrics.py' -v
+```
+
+`--installed` reads the current installation registry, not every cached version.
+`--claude-home` selects another registry directory. User enablement is reported
+separately; effective session/project enablement remains unknown.
+
+`--annotations PATH` accepts optional advisory schema-v1 JSON keyed by manifest name,
+directory name or absolute root:
+
+```json
+{"schema_version": 1, "plugins": {"plugin-name": {"claims": [
+  {"file": "skills/a/SKILL.md", "excerpt": "requires engine",
+   "target": "engine", "operation": "invoke", "requiredness": "required",
+   "role": "core", "scope": "principal", "basis": "direct",
+   "origin": "external_application"}],
+  "unresolved": []}}}
+```
+
+`origin` is one of `external_application`, `external_cli`, `hosted_service`,
+`bundled_code`, `host_tool` or `unknown` (default).
+
+Each citation must resolve inside the plugin root and quote existing text verbatim.
+Any successfully decoded in-root text/code file can be cited, including `.sh`, `.json`,
+`.ts` and extensionless executables; undecodable extensionless files are excluded as
+unsupported formats.
+Any invalid claim rejects that plugin's whole annotation and records a coverage gap;
+missing or invalid files never crash and never prove absence. Output retains claim
+structure and an excerpt hash, not the excerpt text. `unresolved` notes remain
+informational. Policy v4: only direct, required, core, principal claims whose origin
+is an external application, CLI or hosted service add the advisory
+`ENRICHED_EXTERNAL_CAPABILITY_PROVIDER` rejection; the same external claims with
+mixed/unknown scope become `EXTERNAL_CAPABILITY_MIXED`; interpretation basis,
+unknown origin or core/auxiliary contradictions yield `ENRICHED_AMBIGUOUS`.
+`bundled_code`/`host_tool` core claims and optional/auxiliary claims never reject.
+Validated claims supersede the weaker lexical operational-evidence heuristic, but
+hard structural blockers and enriched ambiguity still apply. No annotation entry
+leaves the static policy unchanged; invalid/missing annotations stay conservative.
+Only excluded instruction entries, manifests, hooks or MCP configs are
+decision-blocking coverage gaps. The script performs no LLM or network calls itself.
+
+Validated annotations are cached under `--cache-dir` (default
+`~/.cache/claude-skill-recomposer/annotations`); `--no-cache` disables read and
+write. Each plugin exposes a timestamp-free `content_digest` over read text and
+exclusion facts. Cache selection requires an exact digest match, so edits invalidate
+entries; corrupt, unreadable or stale entries are ignored with a non-fatal note.
+`facts.enrichment.source` reports `file`, `cache` or `absent`, and `--annotations`
+always wins over cache. Cache files are written atomically with `0600` permissions
+in a `0700` directory; invalid annotations are never cached. Cache format v2 retains
+minimal verbatim excerpts privately and rechecks them against source content on every
+read; public reports contain only excerpt hashes. Old hash-only entries are ignored
+until refreshed from validated annotations. Symlinked cache leaves/files and existing
+non-private cache directories are refused, not chmod'd. A local cache owner can still
+forge semantic labels attached to genuine quotes: this is provenance, not a signature.
+
+The JSON contains artifact inventory, dependency/product candidates, lexical
+instruction-role signals, coverage, exclusions and errors. Structural facts are
+separate from heuristic candidates. Software autonomy and dependency roles remain
+unknown: code examples, URLs and mentions do not prove runtime dependencies.
+Artifact counts include nested copies/examples; `entrypoint_candidates` separates
+conventional top-level skills. Neither reproduces Claude Code's loader.
+Observations aggregate occurrences and retain at most three evidence locations.
+Source text, command arguments and environment values are not copied into evidence.
+Non-Markdown programs are inventoried, not semantically analyzed. Symlinks,
+dependency directories, unsupported formats and files over `--max-file-bytes`
+(default 2 MB) are excluded explicitly. `hooks/hooks.json` accepts either a
+`modules` runtime-mod surface or an event map whose sanitized event names are
+reported as `lifecycle_hook_events`; malformed shapes and unresolved modules leave
+unresolved evidence. Excluded instruction-capable text makes results partial.
+
+JSON goes to stdout; elapsed time including serialization goes to stderr.
+Exit codes: `0` scan completed, `1` discovery failed, `2` partial/plugin errors.
+A completed scan does not establish semantic completeness or eligibility.
+
+`assessment` separates decision facts from a pure, versioned evaluator:
+- `ineligible`: an exposed MCP configuration, a resolved runtime mod module, or no
+  instruction entry (when discovery has no errors).
+- `needs_review`: incomplete discovery or explicit dependency/tool/script language
+  whose necessity and standalone nature are not established.
+- `eligible`: instruction entries with no detected blocker; provisional, not proof.
+
+Only declared/conventional instruction surfaces feed these rules. Catalog MCPs and
+schema examples do not; an explicit empty `mcpServers` overrides the root config.
+Fenced shell examples, helper paths, interpreter/package mentions and optional tools
+alone do not trigger review or rejection. Rule version 2 records intent/description
+locations (not their text), explicit required-operation targets, and unread text/code
+coverage gaps. Requirement language remains candidate evidence, not proof of a core
+dependency; helper-versus-engine and mixed wrapper semantics remain `needs_review`.
+Lexical role counts and inventory mass do not influence decisions.
+
+Synthetic regression principles: vary the requirement while keeping the tool mention;
+contrast helper paths with mandatory engine operations, catalog with exposed integration,
+and complete with size-limited coverage. These tests are reproducible fixtures, not
+calibration against real plugins. No semantic confidence score is claimed.
+
 ## How it works
 
 Skill Recomposition first normalizes the supplied inputs. GitHub URLs are resolved into isolated, commit-pinned temporary source roots; local paths are used directly; and `integrate` can also consume a user intent document or create one interactively when no source is supplied. It then discovers what those inputs actually require or contain. A source may be nothing more than knowledge and instructions, a desired capability that does not exist yet, or a small runtime system with commands, delegated agents, hooks, scripts, manifests, rules, adapters, tests, and supporting references.
